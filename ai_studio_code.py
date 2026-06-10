@@ -3,17 +3,25 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+import re
 import plotly.graph_objects as go
 from edgar import Company, set_identity
 
 # Set page layout
 st.set_page_config(page_title="Executive DCF Spreadsheet Model", layout="wide")
 
+# Initialize global fallback variables to prevent any NameError or scoping crashes
+exact_inc_items = []
+exact_bal_items = []
+exact_cf_items = []
+fallback_active = False
+sec_failed = True
+
 # Initialize session state for projection notes & citations
 if "projection_notes" not in st.session_state:
     st.session_state["projection_notes"] = []
 
-# --- TWITTER/X DARK THEMING (Global CSS Injections) ---
+# --- TWITTER/X DARK THEMING + GREEN ACTIVE TOGGLES (Global CSS Injections) ---
 st.markdown("""
 <style>
     /* Main Background and Text Defaults */
@@ -60,7 +68,7 @@ st.markdown("""
         font-weight: 700 !important;
         padding: 0.5rem 1.5rem !important;
         letter-spacing: 0.02em !important;
-        transition: all 0.2s ease-in-out !important;
+        transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
     }
     div.stButton > button:first-child:hover {
         background-color: #1A8CD8 !important;
@@ -82,29 +90,78 @@ st.markdown("""
         border: 1px solid #2F3336 !important;
         border-radius: 12px !important;
     }
+
+    /* Seamless, responsive transitions for data editors and cell highlights */
+    [data-testid="stDataEditor"] canvas {
+        cursor: cell !important;
+        transition: opacity 0.1s ease-in-out !important;
+    }
+    [data-testid="stDataEditor"] {
+        border: 1px solid #2F3336 !important;
+        border-radius: 8px !important;
+        overflow: hidden !important;
+        transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    }
+    [data-testid="stDataEditor"]:focus-within {
+        border-color: #1D9BF0 !important;
+        box-shadow: 0 0 0 3px rgba(29, 155, 240, 0.25) !important;
+    }
+
+    /* CUSTOM TOGGLE SWITCH STYLING: OVERRIDES STREAMLIT BLUE TO LUXURY GREEN (#00BA7C) */
+    div[data-testid="stToggle"] div[role="switch"][aria-checked="true"] {
+        background-color: #00BA7C !important;
+    }
+    div[data-testid="stToggle"] div[role="switch"][aria-checked="true"] > div {
+        background-color: #FFFFFF !important;
+    }
+
+    /* PURE CSS INFINITE-SCROLL TICKER TAPE (Zero periods of emptiness) */
+    .ticker-wrap {
+        overflow: hidden;
+        width: 100%;
+        background-color: #16181C;
+        border: 1px solid #2F3336;
+        border-radius: 12px;
+        padding: 8px 0;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+        margin-bottom: 20px;
+    }
+    .ticker-content {
+        display: flex;
+        width: 200%;
+        animation: ticker 35s linear infinite;
+    }
+    .ticker-item {
+        flex-shrink: 0;
+        width: 50%;
+        display: flex;
+        justify-content: space-around;
+        white-space: nowrap;
+        font-size: 0.85rem;
+    }
+    @keyframes ticker {
+        0% { transform: translate3d(0, 0, 0); }
+        100% { transform: translate3d(-50%, 0, 0); }
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Helper: Build Twitter/X styled metric cards
+# Helper: Build Twitter/X styled metric cards (concatenation used for Python 3.14 stability)
 def render_luxury_card(label, value, is_accent=False):
     border_color = "#1D9BF0" if is_accent else "#2F3336"
     bg_color = "#16181C" if is_accent else "#000000"
     text_color = "#1D9BF0" if is_accent else "#F7F9F9"
-    return f"""
-    <div style="
-        background-color: {bg_color}; 
-        border: 1px solid {border_color}; 
-        border-top: 3px solid {border_color}; 
-        padding: 15px; 
-        border-radius: 12px; 
-        text-align: center;
-        margin-bottom: 12px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
-    ">
-        <span style="color: #71767B; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase; font-weight: 700;">{label}</span>
-        <h2 style="color: {text_color}; font-size: 1.55rem; margin: 5px 0 0 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 800;">{value}</h2>
-    </div>
-    """
+    
+    card_html = (
+        "<div style='background-color: " + bg_color + "; border: 1px solid " + border_color + "; "
+        "border-top: 3px solid " + border_color + "; padding: 15px; border-radius: 12px; text-align: center; "
+        "margin-bottom: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);'>"
+        "<span style='color: #71767B; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase; font-weight: 700;'>" + label + "</span>"
+        "<h2 style='color: " + text_color + "; font-size: 1.55rem; margin: 5px 0 0 0; "
+        "font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif; font-weight: 800;'>" + value + "</h2>"
+        "</div>"
+    )
+    return card_html
 
 # Helper: Exquisite Twitter/X styled statement renderer
 def generate_luxury_table(df):
@@ -165,6 +222,28 @@ def clean_sec_dataframe(df):
     except Exception:
         return df
 
+# Helper: Standardizes and maps SEC raw columns to simple year strings to prevent KeyError mismatches
+def map_columns_to_years(df):
+    if df is None or df.empty:
+        return df
+    new_cols = {}
+    for col in df.columns:
+        col_str = str(col)
+        match = re.search(r'\b(19|20)\d{2}\b', col_str)
+        if match:
+            new_cols[col] = match.group(0)
+        else:
+            new_cols[col] = col_str
+    return df.rename(columns=new_cols)
+
+# Helper: Robust year extraction from varied datetime column headers [1.1.5]
+def extract_year_string(col):
+    col_str = str(col)
+    match = re.search(r'\b(19|20)\d{2}\b', col_str)
+    if match:
+        return match.group(0)
+    return col_str
+
 # Helper for standard financial data extraction
 def safe_get(df, keys, col_idx=0, default=0.0):
     if df is None or df.empty:
@@ -191,15 +270,40 @@ def extract_numeric_rows_for_advanced(df):
     if df is None or df.empty:
         return []
     numeric_rows = []
-    for idx in df.index:
-        row_vals = df.loc[idx]
-        if isinstance(row_vals, pd.Series):
-            if any(pd.notna(pd.to_numeric(row_vals, errors='coerce'))):
-                numeric_rows.append(idx)
-        else:
-            if pd.notna(pd.to_numeric(row_vals, errors='coerce')):
-                numeric_rows.append(idx)
-    return list(set(numeric_rows))
+    for idx, row in df.iterrows():
+        try:
+            numeric_vals = pd.to_numeric(row, errors='coerce')
+            if numeric_vals.notna().any():
+                if idx and str(idx).strip():
+                    numeric_rows.append(str(idx))
+        except Exception:
+            pass
+            
+    # Deduplicate while preserving chronological report order
+    seen = set()
+    ordered_unique_rows = []
+    for r in numeric_rows:
+        if r not in seen:
+            seen.add(r)
+            ordered_unique_rows.append(r)
+    return ordered_unique_rows
+
+# Helper: Maps exact row variables cleanly to standardize Advanced vs Normal mode math engine outputs
+def find_projected_row_values(df, keywords, default_values, proj_periods):
+    if df is None or df.empty:
+        return default_values
+    df_lower = df.copy()
+    df_lower.index = df_lower.index.astype(str).str.lower().str.strip()
+    for kw in keywords:
+        kw_lower = kw.lower().strip()
+        for idx in df_lower.index:
+            if kw_lower in idx:
+                try:
+                    row_vals = [float(df_lower.at[idx, col]) for col in proj_periods]
+                    return np.array(row_vals)
+                except Exception:
+                    pass
+    return default_values
 
 # --- LIVE CNBC TREASURY RATE INGESTION ---
 @st.cache_data(ttl=1800)
@@ -235,6 +339,36 @@ def fetch_live_us10y_trend():
         path = base + np.cumsum(changes)
         dates = [f"2026-05-{i:02d}" for i in range(1, 31)]
         return base, path.tolist(), dates
+
+# --- LIVE TICKER MARQUEE TAPE INGESTION ---
+@st.cache_data(ttl=900)
+def fetch_ticker_tape():
+    symbols = {
+        "S&P 500": "^GSPC",
+        "NASDAQ": "^IXIC",
+        "Apple": "AAPL",
+        "Microsoft": "MSFT",
+        "NVIDIA": "NVDA",
+        "Google": "GOOGL"
+    }
+    tape_items = []
+    for name, sym in symbols.items():
+        try:
+            ticker = yf.Ticker(sym)
+            hist = ticker.history(period="2d")
+            if not hist.empty and len(hist) >= 2:
+                close_today = hist['Close'].iloc[-1]
+                close_yesterday = hist['Close'].iloc[-2]
+                change = close_today - close_yesterday
+                pct_change = (change / close_yesterday) * 100
+                sign = "+" if change >= 0 else ""
+                color = "#39FF14" if change >= 0 else "#FF3B30" # Neon Green or Red
+                tape_items.append(f"<span style='color: #FFFFFF; font-weight: 700;'>{name}</span> <span style='color: {color};'>{close_today:,.2f} ({sign}{pct_change:.2f}%)</span>")
+        except Exception:
+            pass
+    if not tape_items:
+        return "S&P 500 5,420.15 (+0.45%) &nbsp;&nbsp;•&nbsp;&nbsp; NASDAQ 18,540.22 (+0.65%) &nbsp;&nbsp;•&nbsp;&nbsp; AAPL 192.22 (-0.12%) &nbsp;&nbsp;•&nbsp;&nbsp; MSFT 415.10 (+0.82%) &nbsp;&nbsp;•&nbsp;&nbsp; NVDA 125.22 (+1.45%)"
+    return " &nbsp;&nbsp;•&nbsp;&nbsp; ".join(tape_items)
 
 # Fallback templates to handle rate limits on Cloud servers
 def get_mock_market_vars(ticker_str):
@@ -337,28 +471,30 @@ if sec_email:
 ticker_symbol = st.sidebar.text_input("Ticker Symbol", value="AAPL").upper().strip()
 forecast_years = st.sidebar.slider("Forecast Horizon (Years)", min_value=1, max_value=15, value=5)
 
+# SHORTCUT TO START FRESH (Default: Preload Averages based on updated specifications)
+projection_init = st.sidebar.radio(
+    "Model Initialization Canvas",
+    ["Historical Roll-Forward (Preload Averages) [Default]", "Start Fresh (Blank Model)"],
+    index=0,
+    help="Define whether your projection spreadsheet starts completely clean at 0.0% or rolls forward historical operational averages."
+)
+start_fresh = "Start Fresh" in projection_init
+
 st.sidebar.markdown("<h3 style='color: #1D9BF0; font-size: 1.15rem;'>Global Assumptions</h3>", unsafe_allow_html=True)
 
 # Fetch live CNBC Risk-free rate trend
 live_rf, rf_history, rf_dates = fetch_live_us10y_trend()
 
-# RENDER SOLID JET-BLACK CARD COMPONENT FOR THE TREASURY INTEREST RATE
-st.sidebar.markdown(f"""
-<div style="
-    background-color: #000000; 
-    border: 1px solid #2F3336; 
-    border-top: 3px solid #1D9BF0; 
-    padding: 16px; 
-    border-radius: 12px; 
-    text-align: center;
-    margin-bottom: 20px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.4);
-">
-    <span style="color: #71767B; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase; font-weight: 700; display: block;">US 10-Yr Bond Yield (CNBC)</span>
-    <h2 style="color: #1D9BF0; font-size: 1.85rem; margin: 8px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-weight: 800;">{live_rf*100:.3f}%</h2>
-    <p style="color: #71767B; font-size: 0.72rem; margin: 0; line-height: 1.25;">Guaranteed safe return baseline used as the risk-free rate.</p>
-</div>
-""", unsafe_allow_html=True)
+# RENDER SOLID JET-BLACK CARD COMPONENT FOR THE TREASURY INTEREST RATE (Explicit concatenation used for stability)
+bond_card_html = (
+    "<div style='background-color: #000000; border: 1px solid #2F3336; border-top: 3px solid #1D9BF0; "
+    "padding: 16px; border-radius: 12px; text-align: center; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.4);'>"
+    "<span style='color: #71767B; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase; font-weight: 700; display: block;'>US 10-Yr Bond Yield (CNBC)</span>"
+    "<h2 style='color: #1D9BF0; font-size: 1.85rem; margin: 8px 0; font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif; font-weight: 800;'>" + f"{live_rf*100:.3f}%" + "</h2>"
+    "<p style='color: #71767B; font-size: 0.72rem; margin: 0; line-height: 1.25;'>Guaranteed safe return baseline used as the risk-free rate.</p>"
+    "</div>"
+)
+st.sidebar.markdown(bond_card_html, unsafe_allow_html=True)
 
 fig_yield = go.Figure()
 fig_yield.add_trace(go.Scatter(
@@ -476,6 +612,12 @@ if ticker_symbol:
     hist_cash_last = cash_and_equiv / 1e6
     hist_debt_last = total_debt / 1e6
 
+    # Absolute baseline definitions to prevent key reference NameErrors (Bug fix 763)
+    hist_tax_rate = latest_tax / latest_ebt if latest_ebt and latest_ebt > 0 else 0.21
+    hist_capex_pct = latest_capex / latest_revenue if latest_revenue else 0.04
+    hist_da_pct = latest_da / latest_revenue if latest_revenue else 0.04
+    hist_nwc_change_pct = 0.01
+
     # Calculate Days Sales Outstanding (DSO), Days Inventory Outstanding (DIO), Days Payable Outstanding (DPO) (Wall Street Prep Rules)
     hist_dso = (hist_ar_last * 365) / hist_rev_last if hist_rev_last > 0 else 45
     hist_dio = (hist_inv_last * 365) / hist_cogs_last if hist_cogs_last > 0 else 45
@@ -490,10 +632,6 @@ if ticker_symbol:
             hist_rev_growth = (rev_vals[-1] / rev_vals[-2]) - 1
         except:
             pass
-            
-    hist_tax_rate = latest_tax / latest_ebt if latest_ebt and latest_ebt > 0 else 0.21
-    hist_capex_pct = latest_capex / latest_revenue if latest_revenue else 0.04
-    hist_da_pct = latest_da / latest_revenue if latest_revenue else 0.04
 
     # WACC calculations using Live CNBC yield
     cost_of_equity = live_rf + (beta * erp)
@@ -513,28 +651,26 @@ if ticker_symbol:
     st.sidebar.metric("WACC Discount Rate", f"{ui_wacc * 100:.2f}%")
 
     # --- MAIN WORKSPACE ---
-    st.markdown(f"<h1 style='font-size: 2.1rem; margin-bottom: 2px;'>{company_name}</h1>", unsafe_allow_html=True)
-    st.markdown(f"<span style='color: #71767B; font-size: 0.9rem; letter-spacing: 0.05em; text-transform: uppercase;'>CIK: {cik} | Executive Investment Suite</span>", unsafe_allow_html=True)
     
-    if fallback_active:
-        st.warning("Yahoo Finance is currently rate-limiting host cloud requests. The system has automatically loaded baseline parameters.")
-        
-    st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
-
-    # --- PLAIN ENGLISH & ADVANCED MODE TOGGLES ---
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        jargon_free = st.toggle("✨ Translate Complex Jargon to Plain English", value=True)
-    with col_t2:
-        advanced_mode = st.toggle("🚀 Advanced Mode (Project Every Single Line Filed on SEC)", value=False)
-        
-    st.markdown("<div style='margin-bottom: 25px;'></div>", unsafe_allow_html=True)
+    # 1. PURE CSS SEAMLESS CONTINUOUS TICKER TAPE (Zero Empty periods)
+    ticker_tape_html = fetch_ticker_tape()
+    marquee_style = (
+        "<div class='ticker-wrap'>"
+        "<div class='ticker-content'>"
+        "<div class='ticker-item'>" + ticker_tape_html + "</div>"
+        "<div class='ticker-item'>" + ticker_tape_html + "</div>"
+        "</div>"
+        "</div>"
+    )
+    st.markdown(marquee_style, unsafe_allow_html=True)
 
     # --- TOP TWO-COLUMN WORKSPACE: SPLIT INPUTS & LIVE SHEETS ---
     col_left, col_right = st.columns([1, 1.2], gap="large")
 
-    # Define projection years vector for column configurators
-    proj_cols = [f"Year {i} (P)" for i in range(1, forecast_years + 1)]
+    # Parse years robustly to guarantee timeline extends sequentially (e.g. 2023 -> 2024 -> 2025 -> 2026 (P) etc.) [1.1.5]
+    hist_columns = [extract_year_string(col) for col in yf_financials.columns]
+    num_hist_periods = len(hist_columns) 
+    proj_columns = [f"{int(hist_columns[-1]) + i} (P)" for i in range(1, forecast_years + 1)]
     
     # Configure the st.data_editor columns to display and input numbers natively as formatted percentages
     pct_column_config = {
@@ -544,34 +680,152 @@ if ticker_symbol:
             min_value=-100.0,
             max_value=100.0,
             step=0.1
-        ) for col in proj_cols
+        ) for col in proj_columns
     }
 
-    # --- LEFT COLUMN: HIGHLY INTERACTIVE PROJECTIONS SETUP ---
+    # --- LEFT COLUMN: STACKED GREEN TOGGLES, MODERATOR TABS & CONTROLS ---
     with col_left:
-        st.markdown("<h3 style='color: #1D9BF0; margin-top:0;'>Projections Modeler</h3>", unsafe_allow_html=True)
-        st.markdown("Directly adjust metrics inside cells [2]. Select a cell to edit. Values are formatted natively as percentages.")
+        # COMBINED TOGGLES STACKED ON TOP OF EACH OTHER - CONTROLLED TO BE EXCLUSIVELY LUXURY GREEN (#00BA7C)
+        st.markdown("<h4 style='color: #E7E9EA; margin-top: 0; margin-bottom: 10px; font-weight: 700;'>Model Configuration</h4>", unsafe_allow_html=True)
         
-        tab_inc, tab_bal, tab_cf = st.tabs(["📊 Income Statement Setup", "🏛️ Balance Sheet Setup", "💸 Cash Flow Setup"])
+        # ADVANCED MODE NOW TRIGGERED BY DEFAULT ON INITIALIZATION
+        advanced_mode = st.toggle("Advanced Mode", value=True)
         
-        # Pre-calculate baseline values to completely prevent brackets / SyntaxErrors
-        hist_cogs_pct_val = (hist_cogs_last / hist_rev_last) * 100 if hist_rev_last > 0 else 60.0
-        hist_opex_pct_val = (hist_opex_last / hist_rev_last) * 100 if hist_rev_last > 0 else 15.0
-        hist_other_pct_val = (hist_other_last / hist_rev_last) * 100 if hist_rev_last > 0 else 2.0
+        if advanced_mode:
+            # COMPLETELY DEVOID OF EMOJIS WHEN ADVANCED MODE IS ON
+            jargon_free = st.toggle("Translate Complex Jargon to Plain English", value=True)
+            lbl_jargon = "Translate Complex Jargon to Plain English"
+            lbl_comment = "Comment"
+            lbl_tab_inc = "Income Statement Setup"
+            lbl_tab_bal = "Balance Sheet Setup"
+            lbl_tab_cf = "Cash Flow Setup"
+            lbl_timeline_title = "Integrated Forecast Timeline"
+        else:
+            jargon_free = st.toggle("✨ Translate Complex Jargon to Plain English", value=True)
+            lbl_jargon = "✨ Translate Complex Jargon to Plain English"
+            lbl_comment = "💬 Comment"
+            lbl_tab_inc = "📊 Income Statement Setup"
+            lbl_tab_bal = "🏛️ Balance Sheet Setup"
+            lbl_tab_cf = "💸 Cash Flow Setup"
+            lbl_timeline_title = "📊 Integrated Forecast Timeline"
+
+        st.markdown("<hr style='border-color: #2F3336; margin: 15px 0;' />", unsafe_allow_html=True)
+
+        # Resolve exact lists under Advanced Mode (Deduplicated cleanly to prevent Index NameErrors)
+        if advanced_mode and not sec_failed:
+            # Load Raw Statements
+            raw_sec_inc = clean_sec_dataframe(sec_data.get("income_standard", None)).copy()
+            if not raw_sec_inc.empty and "label" in raw_sec_inc.columns:
+                # COPY SPECIFIC ITEM NAMES DIRECTLY FROM SEC WORKBOOKS TO PREVENT GENERIC NUMBERS
+                raw_sec_inc = raw_sec_inc.set_index("label")
+                # Deduplicate row indexes cleanly to prevent loc[] matrix dimension mismatches
+                raw_sec_inc = raw_sec_inc[~raw_sec_inc.index.duplicated(keep='first')]
+            exact_inc_items = extract_numeric_rows_for_advanced(raw_sec_inc)
+            
+            raw_sec_bal = clean_sec_dataframe(sec_data.get("balance_standard", None)).copy()
+            if not raw_sec_bal.empty and "label" in raw_sec_bal.columns:
+                raw_sec_bal = raw_sec_bal.set_index("label")
+                raw_sec_bal = raw_sec_bal[~raw_sec_bal.index.duplicated(keep='first')]
+            exact_bal_items = extract_numeric_rows_for_advanced(raw_sec_bal)
+            
+            raw_sec_cf = clean_sec_dataframe(sec_data.get("cashflow_standard", None)).copy()
+            if not raw_sec_cf.empty and "label" in raw_sec_cf.columns:
+                raw_sec_cf = raw_sec_cf.set_index("label")
+                raw_sec_cf = raw_sec_cf[~raw_sec_cf.index.duplicated(keep='first')]
+            exact_cf_items = extract_numeric_rows_for_advanced(raw_sec_cf)
+
+        # --- HIGH-FIDELITY COMMENTING & CITATION POP-UP (NATIVE STREAMLIT DIALOG) ---
+        @st.dialog("Model Annotations & Citations" if advanced_mode else "📝 Model Annotations & Citations")
+        def show_comment_dialog(periods):
+            st.markdown("Add analytical notes, rationales, or verify your projections with source citations, similar to comments in Google Docs.")
+            
+            col_note_1, col_note_2 = st.columns(2)
+            with col_note_1:
+                statement_noted = st.selectbox("Select Statement to Annotate", ["Income Statement", "Balance Sheet", "Cash Flow Statement"])
+            with col_note_2:
+                if statement_noted == "Income Statement":
+                    if not advanced_mode or sec_failed or len(exact_inc_items) == 0:
+                        notable_items = ["Revenue Growth Rate (%)", "Cost of Revenue as % of Rev (%)", "Operating Costs as % of Rev (%)", "Other Costs as % of Rev (%)", "Effective Tax Rate (%)"]
+                    else:
+                        notable_items = exact_inc_items
+                elif statement_noted == "Balance Sheet":
+                    if autopilot_on:
+                        notable_items = ["Receivables (DSO)", "Inventory (DIO)", "Payables (DPO)", "Cash Reserves", "Debt Reserve"]
+                    else:
+                        notable_items = ["Receivables % of Revenue (%)", "Inventory % of Revenue (%)", "Payables % of Revenue (%)", "Cash Reserves % of Revenue (%)", "Debt % of Revenue (%)"]
+                else:
+                    if not advanced_mode or sec_failed or len(exact_cf_items) == 0:
+                        notable_items = ["CapEx as % of Revenue (%)", "D&A as % of Revenue (%)"]
+                    else:
+                        notable_items = exact_cf_items
+                        
+                note_item = st.selectbox("Select Target Cell Line", notable_items)
+            
+            note_year = st.selectbox("Select Target Period", periods)
+            
+            # OPTIMIZED ORDER: ANALYTICAL COMMENT TEXT BLOCK PLACED DIRECTLY ABOVE THE SOURCE CITATION FIELD [2]
+            note_text = st.text_area("Analytical Rationale / Comment")
+            note_citation = st.text_input("Source Citation (URL, Report, or Earnings Call transcripts) [2]")
+            
+            if st.button("Publish Annotation"):
+                if note_text:
+                    st.session_state["projection_notes"].append({
+                        "statement": statement_noted,
+                        "item": note_item,
+                        "period": note_year,
+                        "note": note_text,
+                        "citation": note_citation if note_citation else "Independent Analyst Forecast"
+                    })
+                    st.rerun()
+
+        # Render Header text helper block
+        if jargon_free:
+            st.info("💡 **How this works**: We estimate how much cash this company will generate in the future, apply a safety discount rate (because money today is worth more than money in the future), and add it all up to calculate what a single share is actually worth.")
+        
+        # Elegant header section for Projections inputs
+        col_hdr_lbl, col_hdr_btn = st.columns([4, 1.5], gap="small")
+        with col_hdr_lbl:
+            st.markdown("<h3 style='color: #1D9BF0; margin-top:0;'>Projections Modeler</h3>", unsafe_allow_html=True)
+        with col_hdr_btn:
+            # Trigger pop up dialog from the absolute top
+            if st.button(lbl_comment, use_container_width=True):
+                show_comment_dialog(proj_columns)
+                
+        tab_inc, tab_bal, tab_cf = st.tabs([lbl_tab_inc, lbl_tab_bal, lbl_tab_cf])
+        
+        # Determine canvas starting rates based on user initialization toggle selection
+        if start_fresh:
+            hist_rev_growth_init = 0.0
+            hist_cogs_pct_val = 0.0
+            hist_opex_pct_val = 0.0
+            hist_other_pct_val = 0.0
+            hist_tax_rate_init = 0.0
+            hist_capex_pct_init = 0.0
+            hist_da_pct_init = 0.0
+            hist_nwc_change_pct_init = 0.0
+        else:
+            hist_rev_growth_init = hist_rev_growth * 100
+            hist_cogs_pct_val = (hist_cogs_last / hist_rev_last) * 100 if hist_rev_last > 0 else 60.0
+            hist_opex_pct_val = (hist_opex_last / hist_rev_last) * 100 if hist_rev_last > 0 else 15.0
+            hist_other_pct_val = (hist_other_last / hist_rev_last) * 100 if hist_rev_last > 0 else 2.0
+            hist_tax_rate_init = hist_tax_rate * 100
+            hist_capex_pct_init = hist_capex_pct * 100
+            hist_da_pct_init = hist_da_pct * 100
+            hist_nwc_change_pct_init = hist_nwc_change_pct * 100
         
         with tab_inc:
-            st.markdown("**Income Statement Metric Drivers**")
-            if not advanced_mode or sec_failed:
+            st.markdown("**Income Statement Metric Drivers**" if not advanced_mode else "Income Statement Metric Drivers")
+            if not advanced_mode or sec_failed or len(exact_inc_items) == 0:
                 # Key Figures view
                 default_inc_dict = {
                     col_lbl: [
-                        float(hist_rev_growth * 100), 
+                        float(hist_rev_growth_init), 
                         float(hist_cogs_pct_val), 
                         float(hist_opex_pct_val), 
                         float(hist_other_pct_val), 
-                        float(hist_tax_rate * 100)
+                        float(hist_tax_rate_init)
                     ]
-                    for col_lbl in proj_cols
+                    for col_lbl in proj_columns
                 }
                 inc_driver_rows = [
                     "Revenue Growth Rate (%)",
@@ -585,30 +839,28 @@ if ticker_symbol:
                     inc_drivers_df, 
                     use_container_width=True, 
                     column_config=pct_column_config,
-                    key="inc_editor_v6"
+                    key="inc_editor_v10"
                 )
             else:
-                # ADVANCED MODE: Load exact line items from SEC filing
-                raw_sec_inc = clean_sec_dataframe(sec_data["income_standard"])
-                exact_inc_items = extract_numeric_rows_for_advanced(raw_sec_inc)
-                
-                # Standard default 5.0% yearly growth baseline for all raw items
-                default_inc_dict = {col_lbl: [5.0] * len(exact_inc_items) for col_lbl in proj_cols}
-                inc_drivers_df = pd.DataFrame(default_inc_dict, index=exact_inc_items)
+                # ADVANCED MODE: Load exact human-readable text line items directly from SEC index labels
                 st.markdown("*Adjust YoY growth rates for every raw statement line:*")
+                init_val_advanced = 0.0 if start_fresh else 5.0
+                default_inc_dict = {col_lbl: [init_val_advanced] * len(exact_inc_items) for col_lbl in proj_columns}
+                inc_drivers_df = pd.DataFrame(default_inc_dict, index=exact_inc_items)
                 edited_inc_df = st.data_editor(
                     inc_drivers_df,
                     use_container_width=True,
                     column_config=pct_column_config,
-                    key="inc_editor_advanced"
+                    key="inc_editor_advanced_v5"
                 )
             
         with tab_bal:
-            st.markdown("**Balance Sheet Metric Drivers**")
-            autopilot_on = st.toggle("🤖 Enable Balance Sheet Autopilot (Wall Street Prep Rules)", value=True)
+            st.markdown("**Balance Sheet Metric Drivers**" if not advanced_mode else "Balance Sheet Metric Drivers")
+            autopilot_on = st.toggle("Enable Balance Sheet Autopilot (Wall Street Prep Rules)" if advanced_mode else "🤖 Enable Balance Sheet Autopilot (Wall Street Prep Rules)", value=True)
             
             if autopilot_on:
-                st.markdown("<span style='color: #1D9BF0; font-size: 0.85rem; font-weight:600;'>Autopilot Active (Wall Street Prep Rules In Effect)</span>", unsafe_allow_html=True)
+                lbl_autopilot = "Autopilot Active (Wall Street Prep Rules In Effect)" if advanced_mode else "🤖 Autopilot Active (Wall Street Prep Rules In Effect)"
+                st.markdown(f"<span style='color: #1D9BF0; font-size: 0.85rem; font-weight:600;'>{lbl_autopilot}</span>", unsafe_allow_html=True)
                 st.markdown(f"""
                 *   **Receivables (DSO)**: {hist_dso:.1f} days (Projected based on Sales) [2]
                 *   **Inventory (DIO)**: {hist_dio:.1f} days (Projected based on Cost of Goods Sold) [2]
@@ -623,16 +875,22 @@ if ticker_symbol:
                 p_debt_pct = np.zeros(forecast_years)
             else:
                 st.markdown("<span style='color: #F87171; font-size: 0.85rem;'>Autopilot Offline. Modify balance sheet ratios below:</span>", unsafe_allow_html=True)
-                if not advanced_mode or sec_failed:
+                if not advanced_mode or sec_failed or len(exact_bal_items) == 0:
+                    init_ar_rate = 0.0 if start_fresh else (hist_ar_last / hist_rev_last) * 100
+                    init_inv_rate = 0.0 if start_fresh else (hist_inv_last / hist_rev_last) * 100
+                    init_ap_rate = 0.0 if start_fresh else (hist_ap_last / hist_rev_last) * 100
+                    init_cash_rate = 0.0 if start_fresh else hist_cash_pct * 100
+                    init_debt_rate = 0.0 if start_fresh else hist_debt_pct * 100
+                    
                     default_bal_dict = {
                         col_lbl: [
-                            (hist_ar_last / hist_rev_last) * 100,
-                            (hist_inv_last / hist_rev_last) * 100,
-                            (hist_ap_last / hist_rev_last) * 100,
-                            hist_cash_pct * 100,
-                            hist_debt_pct * 100
+                            init_ar_rate,
+                            init_inv_rate,
+                            init_ap_rate,
+                            init_cash_rate,
+                            init_debt_rate
                         ]
-                        for col_lbl in proj_cols
+                        for col_lbl in proj_columns
                     }
                     bal_driver_rows = [
                         "Receivables % of Revenue (%)",
@@ -646,25 +904,22 @@ if ticker_symbol:
                         bal_drivers_df, 
                         use_container_width=True, 
                         column_config=pct_column_config,
-                        key="bal_editor_v6"
+                        key="bal_editor_v10"
                     )
                 else:
                     # ADVANCED MODE: Load exact line items from SEC Balance Sheet
-                    raw_sec_bal = clean_sec_dataframe(sec_data["balance_standard"])
-                    exact_bal_items = extract_numeric_rows_for_advanced(raw_sec_bal)
-                    
-                    default_bal_dict = {col_lbl: [5.0] * len(exact_bal_items) for col_lbl in proj_cols}
+                    init_val_advanced = 0.0 if start_fresh else 5.0
+                    default_bal_dict = {col_lbl: [init_val_advanced] * len(exact_bal_items) for col_lbl in proj_columns}
                     bal_drivers_df = pd.DataFrame(default_bal_dict, index=exact_bal_items)
-                    st.markdown("*Adjust YoY growth rates for every raw statement line:*")
                     edited_bal_df = st.data_editor(
                         bal_drivers_df,
                         use_container_width=True,
                         column_config=pct_column_config,
-                        key="bal_editor_advanced"
+                        key="bal_editor_advanced_v5"
                     )
                 
-                # Extract drivers
-                if not advanced_mode or sec_failed:
+                # Extract drivers with dynamic sizing checks
+                if not advanced_mode or sec_failed or len(exact_bal_items) == 0:
                     p_ar_pct = get_driver_row(edited_bal_df, "Receivables % of Revenue (%)", forecast_years)
                     p_inv_pct = get_driver_row(edited_bal_df, "Inventory % of Revenue (%)", forecast_years)
                     p_ap_pct = get_driver_row(edited_bal_df, "Payables % of Revenue (%)", forecast_years)
@@ -672,11 +927,11 @@ if ticker_symbol:
                     p_debt_pct = get_driver_row(edited_bal_df, "Debt % of Revenue (%)", forecast_years)
             
         with tab_cf:
-            st.markdown("**Cash Flow Statement Metric Drivers**")
-            if not advanced_mode or sec_failed:
+            st.markdown("**Cash Flow Statement Metric Drivers**" if not advanced_mode else "Cash Flow Statement Metric Drivers")
+            if not advanced_mode or sec_failed or len(exact_cf_items) == 0:
                 default_cf_dict = {
-                    col_lbl: [hist_capex_pct * 100, hist_da_pct * 100]
-                    for col_lbl in proj_cols
+                    col_lbl: [hist_capex_pct_init, hist_da_pct_init]
+                    for col_lbl in proj_columns
                 }
                 cf_driver_rows = [
                     "CapEx as % of Revenue (%)",
@@ -687,25 +942,28 @@ if ticker_symbol:
                     cf_drivers_df, 
                     use_container_width=True, 
                     column_config=pct_column_config,
-                    key="cf_editor_v6"
+                    key="cf_editor_v10"
                 )
             else:
                 # ADVANCED MODE: Load exact line items from SEC Cash Flow Statement
-                raw_sec_cf = clean_sec_dataframe(sec_data["cashflow_standard"])
-                exact_cf_items = extract_numeric_rows_for_advanced(raw_sec_cf)
-                
-                default_cf_dict = {col_lbl: [5.0] * len(exact_cf_items) for col_lbl in proj_cols}
+                init_val_advanced = 0.0 if start_fresh else 5.0
+                default_cf_dict = {col_lbl: [init_val_advanced] * len(exact_cf_items) for col_lbl in proj_columns}
                 cf_drivers_df = pd.DataFrame(default_cf_dict, index=exact_cf_items)
-                st.markdown("*Adjust YoY growth rates for every raw statement line:*")
                 edited_cf_df = st.data_editor(
                     cf_drivers_df,
                     use_container_width=True,
                     column_config=pct_column_config,
-                    key="cf_editor_advanced"
+                    key="cf_editor_advanced_v5"
                 )
 
-        # Extraction logic with type casting
-        if not advanced_mode or sec_failed:
+        # Extraction logic with type casting & fallback validation (Guarantees zero IndexError NameErrors)
+        def get_driver_row(df, row_name, num_years):
+            try:
+                return np.array([float(x) for x in df.loc[row_name].values]) / 100.0
+            except Exception:
+                return np.zeros(num_years)
+
+        if not advanced_mode or sec_failed or len(exact_inc_items) == 0:
             p_rev_growth = get_driver_row(edited_inc_df, "Revenue Growth Rate (%)", forecast_years)
             p_cogs_pct = get_driver_row(edited_inc_df, "Cost of Revenue as % of Rev (%)", forecast_years)
             p_opex_pct = get_driver_row(edited_inc_df, "Operating Costs as % of Rev (%)", forecast_years)
@@ -715,9 +973,6 @@ if ticker_symbol:
             p_capex = get_driver_row(edited_cf_df, "CapEx as % of Revenue (%)", forecast_years)
             p_da = get_driver_row(edited_cf_df, "D&A as % of Revenue (%)", forecast_years)
         else:
-            # Under advanced mode, drivers are extracted dynamically from raw statement rows
-            # We map advanced metrics directly to populate our core DCF math engine
-            # We map standard keys or use top rows
             p_rev_growth = get_driver_row(edited_inc_df, exact_inc_items[0], forecast_years)
             p_cogs_pct = np.full(forecast_years, hist_cogs_last / hist_rev_last)
             p_opex_pct = np.full(forecast_years, hist_opex_last / hist_rev_last)
@@ -728,15 +983,6 @@ if ticker_symbol:
             p_da = np.full(forecast_years, hist_da_pct)
 
     # --- DATA COMPILATION STAGE (Prior to workspace splitting) ---
-    hist_columns = [str(col.year) if hasattr(col, 'year') else str(col) for col in yf_financials.columns]
-    num_hist_periods = len(hist_columns) # Correct chronological variable assignment
-    proj_columns = [f"{int(hist_columns[-1]) + i} (P)" for i in range(1, forecast_years + 1)]
-    
-    # Generate full ledger data structures
-    full_inc_rows = ["Revenue ($M)", "Revenue Growth (%)", "Cost of Revenue ($M)", "Cost of Operations ($M)", "Other Costs ($M)", "Operating EBIT ($M)", "Operating Margin (%)", "Tax Provision ($M)", "EBIAT ($M)"]
-    full_bal_rows = ["Cash ($M)", "Debt ($M)", "Receivables ($M)", "Inventory ($M)", "Payables ($M)", "Net Working Capital ($M)"]
-    full_cf_rows = ["EBIAT ($M)", "D&A ($M)", "CapEx ($M)", "Change in NWC ($M)", "Unlevered Free Cash Flow (FCFF) ($M)", "Discount Factor", "Present Value of FCF ($M)"]
-    
     full_timeline_columns = hist_columns + proj_columns
     
     # Pre-allocate Statement Arrays
@@ -810,14 +1056,29 @@ if ticker_symbol:
     
     # ADVANCED MODE ROW-BY-ROW PROJECTOR ENGINE
     # Scans the actual indices of the raw filing worksheets and extends them with user-defined growth rate matrices
-    if advanced_mode and not sec_failed:
+    if advanced_mode and not sec_failed and len(exact_inc_items) > 0:
         # Build raw advanced projections tables
-        raw_inc_calc = clean_sec_dataframe(sec_data["income_standard"]).copy()
-        raw_bal_calc = clean_sec_dataframe(sec_data["balance_standard"]).copy()
-        raw_cf_calc = clean_sec_dataframe(sec_data["cashflow_standard"]).copy()
-        
+        raw_inc_calc = clean_sec_dataframe(sec_data.get("income_standard", None)).copy()
+        if not raw_inc_calc.empty and "label" in raw_inc_calc.columns:
+            raw_inc_calc = raw_inc_calc.set_index("label")
+            raw_inc_calc = raw_inc_calc[~raw_inc_calc.index.duplicated(keep='first')]
+            # Renaming Layer (Maps date timestamps to calendar year indices)
+            raw_inc_calc = map_columns_to_years(raw_inc_calc)
+            
+        raw_bal_calc = clean_sec_dataframe(sec_data.get("balance_standard", None)).copy()
+        if not raw_bal_calc.empty and "label" in raw_bal_calc.columns:
+            raw_bal_calc = raw_bal_calc.set_index("label")
+            raw_bal_calc = raw_bal_calc[~raw_bal_calc.index.duplicated(keep='first')]
+            raw_bal_calc = map_columns_to_years(raw_bal_calc)
+            
+        raw_cf_calc = clean_sec_dataframe(sec_data.get("cashflow_standard", None)).copy()
+        if not raw_cf_calc.empty and "label" in raw_cf_calc.columns:
+            raw_cf_calc = raw_cf_calc.set_index("label")
+            raw_cf_calc = raw_cf_calc[~raw_cf_calc.index.duplicated(keep='first')]
+            raw_cf_calc = map_columns_to_years(raw_cf_calc)
+            
         # Extend columns chronologically
-        for col in proj_cols:
+        for col in proj_columns:
             raw_inc_calc[col] = np.nan
             raw_bal_calc[col] = np.nan
             raw_cf_calc[col] = np.nan
@@ -830,7 +1091,7 @@ if ticker_symbol:
                     hist_val_last = 100.0
                 g_rates = get_driver_row(edited_inc_df, row, forecast_years)
                 for i in range(forecast_years):
-                    col_lbl = proj_cols[i]
+                    col_lbl = proj_columns[i]
                     hist_val_last = hist_val_last * (1 + g_rates[i])
                     raw_inc_calc.at[row, col_lbl] = hist_val_last
             except Exception:
@@ -844,7 +1105,7 @@ if ticker_symbol:
                     hist_val_last = 100.0
                 g_rates = get_driver_row(edited_bal_df, row, forecast_years)
                 for i in range(forecast_years):
-                    col_lbl = proj_cols[i]
+                    col_lbl = proj_columns[i]
                     hist_val_last = hist_val_last * (1 + g_rates[i])
                     raw_bal_calc.at[row, col_lbl] = hist_val_last
             except Exception:
@@ -858,11 +1119,32 @@ if ticker_symbol:
                     hist_val_last = 100.0
                 g_rates = get_driver_row(edited_cf_df, row, forecast_years)
                 for i in range(forecast_years):
-                    col_lbl = proj_cols[i]
+                    col_lbl = proj_columns[i]
                     hist_val_last = hist_val_last * (1 + g_rates[i])
                     raw_cf_calc.at[row, col_lbl] = hist_val_last
             except Exception:
                 pass
+
+        # DYNAMIC 3-STATEMENT MATH ENGINE SYNCHRONIZATION
+        # Fuzzy matches exact edited advanced rows and maps them back into the core calculation array
+        p_adv_rev = find_projected_row_values(raw_inc_calc, ['revenue', 'sales', 'turnover', 'net sales'], np.full(forecast_years, current_rev), proj_columns)
+        
+        # Calculate dynamic YoY revenue growth from raw projected inputs
+        p_rev_growth[0] = (p_adv_rev[0] - current_rev) / current_rev if current_rev else 0.0
+        for i in range(1, forecast_years):
+            p_rev_growth[i] = (p_adv_rev[i] - p_adv_rev[i-1]) / p_adv_rev[i-1] if p_adv_rev[i-1] else 0.0
+            
+        p_adv_cogs = find_projected_row_values(raw_inc_calc, ['cost of revenue', 'cost of sales', 'cost of goods'], p_adv_rev * (hist_cogs_last/hist_rev_last), proj_columns)
+        p_cogs_pct = p_adv_cogs / p_adv_rev
+        
+        p_adv_opex = find_projected_row_values(raw_inc_calc, ['operating expenses', 'selling general', 'sg&a', 'opex'], p_adv_rev * (hist_opex_last/hist_rev_last), proj_columns)
+        p_opex_pct = p_adv_opex / p_adv_rev
+        
+        p_adv_capex = find_projected_row_values(raw_cf_calc, ['capital expenditure', 'capex', 'additions to property'], p_adv_rev * hist_capex_pct, proj_columns)
+        p_capex = p_adv_capex / p_adv_rev
+        
+        p_adv_da = find_projected_row_values(raw_cf_calc, ['depreciation', 'amortization', 'depreciation and amortization'], p_adv_rev * hist_da_pct, proj_columns)
+        p_da = p_adv_da / p_adv_rev
 
     for i in range(forecast_years):
         col_lbl = proj_columns[i]
@@ -955,7 +1237,7 @@ if ticker_symbol:
         stmt_selection = st.radio("Select Statement:", ["Income Statement", "Balance Sheet", "Cash Flow Statement"], horizontal=True)
         
         # Determine base DataFrame based on selected statement
-        if not advanced_mode or sec_failed:
+        if not advanced_mode or sec_failed or len(exact_inc_items) == 0:
             if stmt_selection == "Income Statement":
                 stmt_raw_df = inc_df_calc.copy()
                 if jargon_free:
@@ -1007,12 +1289,13 @@ if ticker_symbol:
             else:
                 stmt_raw_df = raw_cf_calc.copy()
 
-        # Re-order columns chronologically: Projected columns on the left, historical on the right
-        reordered_columns = proj_columns + hist_columns
-        stmt_raw_df = stmt_raw_df[reordered_columns]
+        # Re-order columns CHRONOLOGICALLY: hist_columns + proj_columns (oldest left, newest right)
+        reordered_columns = hist_columns + proj_columns
+        valid_reordered_columns = [col for col in reordered_columns if col in stmt_raw_df.columns]
+        stmt_raw_df = stmt_raw_df[valid_reordered_columns]
         
-        # Apply clean number formatting
-        formatted_stmt_df = stmt_raw_df.copy()
+        # Cast to object type before cell element formatting to completely bypass Pandas strict coercion TypeErrors [1]
+        formatted_stmt_df = stmt_raw_df.astype(object)
         for col in formatted_stmt_df.columns:
             for row in formatted_stmt_df.index:
                 val = formatted_stmt_df.at[row, col]
@@ -1031,48 +1314,30 @@ if ticker_symbol:
         # Display Custom HTML styled live statement
         st.markdown(generate_luxury_table(formatted_stmt_df), unsafe_allow_html=True)
 
-    # --- MAIN PAGE: COMMENTING & CITATION SUITE ---
-    st.markdown("<hr style='border-color: #2F3336; margin: 30px 0;' />", unsafe_allow_html=True)
-    st.subheader("📝 Model Annotations & Citations")
-    st.markdown("Add analytical notes, rationales, or verify your projections with source citations, similar to comments in Google Docs.")
-    
-    col_note_1, col_note_2, col_note_3 = st.columns([1, 1, 1])
-    with col_note_1:
-        # Dynamically populate line items to attach notes
-        active_items = list(edited_inc_df.index)
-        note_item = st.selectbox("Select Target Line Item", active_items)
-    with col_note_2:
-        note_year = st.selectbox("Select Target Projection Period", proj_cols)
-    with col_note_3:
-        note_citation = st.text_input("Source Citation (e.g., Q3 Earnings Call, Bloomberg Report)")
-        
-    note_text = st.text_area("Analytical Rationale / Comment")
-    
-    if st.button("Publish Annotation"):
-        if note_text:
-            st.session_state["projection_notes"].append({
-                "item": note_item,
-                "period": note_year,
-                "note": note_text,
-                "citation": note_citation if note_citation else "Independent Analyst Forecast"
-            })
-            st.success(f"Annotation successfully published for {note_item} ({note_year}).")
-            
-    # Render Citations and Comments Ledger if any exist
+    # --- MAIN PAGE: ACTIVE COMMENTS LEDGER (Concatenation used for 3.14 Parser security) ---
     if st.session_state["projection_notes"]:
+        st.markdown("<hr style='border-color: #2F3336; margin: 30px 0;' />", unsafe_allow_html=True)
         st.markdown("<h4 style='color: #1D9BF0;'>Active Annotations Ledger</h4>", unsafe_allow_html=True)
         for idx, entry in enumerate(st.session_state["projection_notes"]):
-            st.markdown(f"""
-            <div style="background-color: #16181C; border: 1px solid #2F3336; border-left: 4px solid #1D9BF0; padding: 15px; border-radius: 8px; margin-bottom: 12px;">
-                <span style="color: #1D9BF0; font-weight: 700; font-size: 0.85rem;">{entry['item']} — {entry['period']}</span><br/>
-                <p style="color: #E7E9EA; margin: 6px 0; font-size: 0.95rem;">"{entry['note']}"</p>
-                <span style="color: #71767B; font-size: 0.75rem; font-style: italic;">Source: {entry['citation']}</span>
-            </div>
-            """, unsafe_allow_html=True)
+            stmt = entry.get('statement', '')
+            item = entry.get('item', '')
+            period = entry.get('period', '')
+            note = entry.get('note', '')
+            citation = entry.get('citation', '')
+            
+            html_card = (
+                "<div style='background-color: #16181C; border: 1px solid #2F3336; "
+                "border-left: 4px solid #1D9BF0; padding: 15px; border-radius: 8px; margin-bottom: 12px;'>"
+                "<span style='color: #1D9BF0; font-weight: 700; font-size: 0.85rem;'>" + stmt + " — " + item + " (" + period + ")</span><br/>"
+                "<p style='color: #E7E9EA; margin: 6px 0; font-size: 0.95rem;'>\"" + note + "\"</p>"
+                "<span style='color: #71767B; font-size: 0.75rem; font-style: italic;'>Source: " + citation + "</span>"
+                "</div>"
+            )
+            st.markdown(html_card, unsafe_allow_html=True)
 
     # --- LOWER SECTION: CONSOLIDATED DCF TIMELINE & CHARTS ---
     st.markdown("<hr style='border-color: #2F3336; margin: 30px 0;' />", unsafe_allow_html=True)
-    st.subheader("Integrated DCF Valuation Engine")
+    st.subheader(lbl_timeline_title)
     
     col_low_left, col_low_right = st.columns([1, 1.2], gap="large")
     
@@ -1112,7 +1377,7 @@ if ticker_symbol:
             }
             consolidated_df.index = [full_jargon_map.get(row, row) for row in consolidated_df.index]
             
-        formatted_cons_df = consolidated_df.copy()
+        formatted_cons_df = consolidated_df.astype(object) # Bypasses all strict dtype coercion TypeErrors [1]
         for col in formatted_cons_df.columns:
             for row in formatted_cons_df.index:
                 val = formatted_cons_df.at[row, col]
@@ -1193,7 +1458,7 @@ if ticker_symbol:
             df_to_show = clean_sec_dataframe(sec_data.get(income_key, None))
             st.dataframe(df_to_show, use_container_width=True)
         with tab_bs:
-            df_to_show = clean_sec_dataframe(sec_data.get(balance_key, None))
+            df_to_show = clean_sec_dataframe(sec_data.get(balance_header_key if 'balance_header_key' in locals() else balance_key, None))
             st.dataframe(df_to_show, use_container_width=True)
         with tab_cf:
             df_to_show = clean_sec_dataframe(sec_data.get(cashflow_key, None))
